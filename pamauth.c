@@ -8,6 +8,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 /* For PAM. */
 #include <sys/types.h>
@@ -26,6 +28,9 @@ typedef signed int boolean;
 
 /* Password. */
 #define MAX_PASSWORD ((int) 255)
+
+/* Preprocessor variable to disable all command line switches. */
+/* #define DISABLESWITCHES 1 */
 
 /* Globals. */
 
@@ -155,6 +160,7 @@ null_conv (int nmsg, const struct pam_message **msgs,
 					msg ("PAM_ERROR_MSG - error return");
 				}
 				*resp = NULL;
+				free (r);
 				return (PAM_CONV_ERR);
 				break;
 			case PAM_TEXT_INFO:
@@ -163,6 +169,7 @@ null_conv (int nmsg, const struct pam_message **msgs,
 					msg ("PAM_TEXT_INFO - error return");
 				}
 				*resp = NULL;
+				free (r);
 				return (PAM_CONV_ERR);
 				break;
 			default:
@@ -188,6 +195,29 @@ null_conv (int nmsg, const struct pam_message **msgs,
 	return (PAM_SUCCESS);
 }
 
+/* String check. */
+
+static boolean
+strcheck (char *s)
+{
+	boolean failed;
+	int i;
+	char ch;
+
+	failed = false;
+	for (i=0; i<strlen(s); i++)
+	{
+		ch = s[i];
+
+		/* Alphanumeric or e-mail address. */
+		if (! (isalnum (ch) || ch=='@' || ch=='.' || ch=='-' || ch=='_'))
+		{
+			failed = true;
+		}
+	}
+	return (! failed);
+}
+
 /* PAM authenticate with password. */
 
 static boolean
@@ -199,6 +229,16 @@ pamauth (char *service, char *username, char *password)
 	int endstatus;
 	int r;
 	char *errormsg;
+
+	/* Check. */
+	if (service == NULL || username == NULL || password == NULL)
+	{
+		err (FAILURE, "NULL argument to pamauth");
+	}
+	if (! strcheck (username))
+	{
+		err (FAILURE, "Illegal character in username '%s'", username);
+	}
 
 	/* Create conversion info block and fill. */
 	conv = new (struct pam_conv);
@@ -300,6 +340,90 @@ pamauth (char *service, char *username, char *password)
 	return (r);
 }
 
+/* Limits to string variables in the next function. */
+#define LINELENGTH 1024
+#define MAX_USERNAME 32
+#define MAX_SERVICENAME 256
+
+/* Look up PAM service in a config file. */
+
+char *
+lookup_service (char *conf, char *user)
+{
+
+	/* Config file. */
+	FILE *cf;
+
+	/* Line in config file. */
+	char line[LINELENGTH];
+
+	/* Username. */
+	char *u;
+
+	/* Service name. */
+	char *s;
+
+	/* Service name to be returned. */
+	char *r;
+
+	/* Service name defaults to not found. */
+	r = NULL;
+
+	/* Open config file. Format: username colon service newline. */
+	cf = fopen (conf, "r");
+	if (cf == NULL)
+	{
+		err (FAILURE, "Cannot open config file %s", conf);
+	}
+
+	/* Read file and scan for first match. */
+	(void) fgets (line, LINELENGTH - 1, cf);
+	if (ferror(cf))
+	{
+		err (FAILURE, "Error reading %s", conf);
+	}
+	while (! feof (cf))
+	{
+
+		/* Break it up by the colon. */
+		u = strtok (line, ":");
+		if (u == NULL)
+		{
+			err (FAILURE, "Null returned by strtok - confused");
+		}
+		s = strtok (NULL, "\n");
+		if (s == NULL)
+		{
+			err (FAILURE, "No service for %s - confused", u);
+		}
+
+		/* Got username and service, check. */
+		if (strncmp (u, user, 32) == 0)
+		{
+
+
+			/* Match found, return service name. */
+			r = strdup (s);
+			if (r == NULL)
+			{
+				err (FAILURE, "No space strdup failed");
+			}
+			break;
+		}
+
+		/* Next. */
+		(void) fgets (line, LINELENGTH - 1, cf);
+		if (ferror(cf))
+		{
+			err (FAILURE, "Error reading %s", conf);
+		}
+	}
+
+	/* Return service name or NULL if not found. */
+	(void) fclose (cf);
+	return (r);
+}
+
 /* Print help text. */
 
 static void
@@ -308,11 +432,12 @@ print_help (void)
 	(void) fprintf (stdout, "\
 This program is the PAM authenticator.\n\
 Usage:\n\
-    PamAuthCheck [-h][-d n] username\n\
+    PamAuthCheck [-h][-d n][-l config][-s name] username\n\
 where\n\
     -h              prints this help.\n\
-    -s name         authentication service name.\n\
     -d n            sets debug level.\n\
+    -l config       specify PAM service config file\n\
+    -s name         authentication service name.\n\
     username        is the username to be authenticated.\n\
 The password is taken from the standard input\n\
 The program will use the stanzas in 'irods', that is the\n\
@@ -330,7 +455,7 @@ main (int argc, char *argv[])
 
 	/* Option characters and control string. */
 	int ch;
-	char *options = "d:hs:";
+	char *options = "d:hl:s:";
 
 	/* Username and password. */
 	char *username;
@@ -339,11 +464,23 @@ main (int argc, char *argv[])
 	/* PAM service name, the file in /etc/pam.d. */
 	char *service;
 
+	/* Per user PAM service name. */
+	char *ps;
+
+	/* Service lookup config file name. */
+	char *conf;
+
 	/* Input file buffer. */
 	char buf[MAX_PASSWORD];
 
 	/* Buffer length to use, one less to leave space for the terminating \0. */
 	size_t buflen;
+
+	/* Stat buffer for config file. */
+	struct stat sb;
+
+	/* Stat status. */
+	int ss;
 
 	/* Number of bytes read. */
 	ssize_t status;
@@ -357,9 +494,14 @@ main (int argc, char *argv[])
 	/* Deal with options. */
 	debug = 0;
 	service = "irods";
+	conf = "/etc/pamauth.conf";
 	ch = getopt (argc, argv, options);
 	while (ch != EOF)
 	{
+
+/* Disable switches as a security feature. */
+#ifndef DISABLESWITCHES
+
 		switch (ch)
 		{
 		case 'd':
@@ -372,12 +514,30 @@ main (int argc, char *argv[])
 			/* Help. */
 			print_help ();
 			break;
+		case 'l':
+
+			/* Service lookup config file name with non-default config. */
+			conf = optarg;
+			username = argv[optind];
+			ps = lookup_service (conf, username);
+			if (ps != NULL)
+			{
+				service = ps;
+			}
+			if (debug > 5)
+			{
+				msg ("Trying %s with service %s", username, service);
+			}
+			break;
 		case 's':
 
 			/* Authentication service name specified. */
 			service = optarg;
 			break;
 		}
+
+#endif
+
 		ch = getopt (argc, argv, options);
 	}
 
@@ -434,6 +594,26 @@ main (int argc, char *argv[])
 		err (FAILURE, "Password too long (%ld)", status);
 	}
 
+	/* Look up PAM service when config file exists. */
+	ss = stat (conf, &sb);
+	if (ss == 0)
+	{
+
+		/* Config file found. */
+		ps = lookup_service (conf, username);
+		if (ps != NULL)
+		{
+
+			/* Service specified for this user in the config. */
+			service = ps;
+		}
+		if (debug > 5)
+		{
+			msg ("Authenticating %s with service %s as in %s",
+				username, service, conf);
+		}
+	}
+
 	/* Show what we got. */
 	if (debug > 5)
 	{
@@ -471,4 +651,3 @@ main (int argc, char *argv[])
 		exit (FAILURE);
 	}
 }
-
